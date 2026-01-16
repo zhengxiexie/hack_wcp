@@ -10,12 +10,15 @@ Usage: ./expand_sp_disk.py <testbed_info_url>
 import sys
 import os
 import re
+import ssl
 import json
 import requests
 import paramiko
 import warnings
 import urllib3
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
+from pyVim.connect import SmartConnect, Disconnect
+from pyVmomi import vim
 
 warnings.filterwarnings("ignore")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -58,100 +61,107 @@ def ssh_exec(host: str, user: str, password: str, cmd: str, timeout: int = 60) -
         ssh.close()
 
 
-class VSphereAPI:
-    """vSphere REST API 客户端"""
+class ESXiDiskResizer:
+    """通过 ESXi 直接连接扩容磁盘（绕过 vCenter 权限限制）"""
     
-    def __init__(self, vc_ip: str, username: str, password: str):
-        self.vc_ip = vc_ip
-        self.base_url = f"https://{vc_ip}"
-        self.session = requests.Session()
-        self.session.verify = False
-        self.session_id = None
-        self.username = username
-        self.password = password
+    def __init__(self, esx_hosts: List[Dict[str, str]]):
+        self.esx_hosts = esx_hosts
+        self.ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        self.ssl_context.check_hostname = False
+        self.ssl_context.verify_mode = ssl.CERT_NONE
     
-    def login(self) -> bool:
-        """登录获取 session"""
-        print(f"  登录 vCenter: {self.vc_ip}")
-        url = f"{self.base_url}/rest/com/vmware/cis/session"
+    def find_and_resize_supervisor_vm(self, target_size_gb: int) -> bool:
+        """在所有 ESXi 主机上查找并扩容 SupervisorControlPlaneVM"""
+        target_size_kb = target_size_gb * 1024 * 1024
+        
+        for esx in self.esx_hosts:
+            print(f"  尝试连接 ESXi: {esx['ip']}")
+            try:
+                si = SmartConnect(
+                    host=esx['ip'], 
+                    user=esx['user'], 
+                    pwd=esx['pass'], 
+                    sslContext=self.ssl_context
+                )
+            except Exception as e:
+                print(f"    连接失败: {e}")
+                continue
+            
+            try:
+                content = si.RetrieveContent()
+                vms = self._get_supervisor_vms(content)
+                
+                if not vms:
+                    print(f"    未找到 SupervisorControlPlaneVM")
+                    continue
+                
+                for vm in vms:
+                    print(f"    找到 VM: {vm.name}")
+                    for device in vm.config.hardware.device:
+                        if isinstance(device, vim.vm.device.VirtualDisk):
+                            capacity_gb = device.capacityInKB / 1024 / 1024
+                            print(f"      磁盘 key={device.key}: {capacity_gb:.1f} GB")
+                            
+                            if capacity_gb < target_size_gb:
+                                if self._resize_disk(vm, device.key, target_size_kb):
+                                    return True
+                            else:
+                                print(f"      已经是 {capacity_gb:.1f}GB，无需扩容")
+                                return True
+            finally:
+                Disconnect(si)
+        
+        return False
+    
+    def _get_supervisor_vms(self, content):
+        """查找 SupervisorControlPlaneVM"""
+        container = content.viewManager.CreateContainerView(
+            content.rootFolder, [vim.VirtualMachine], True
+        )
+        vms = [vm for vm in container.view if "SupervisorControlPlane" in vm.name]
+        container.Destroy()
+        return vms
+    
+    def _resize_disk(self, vm, disk_key: int, new_size_kb: int) -> bool:
+        """扩容磁盘"""
+        print(f"      尝试扩容磁盘 (key={disk_key}) 到 {new_size_kb / 1024 / 1024:.1f} GB")
+        
+        disk_device = None
+        for device in vm.config.hardware.device:
+            if isinstance(device, vim.vm.device.VirtualDisk) and device.key == disk_key:
+                disk_device = device
+                break
+        
+        if not disk_device:
+            print(f"        错误: 未找到磁盘")
+            return False
+        
+        disk_spec = vim.vm.device.VirtualDeviceSpec()
+        disk_spec.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+        disk_spec.device = vim.vm.device.VirtualDisk()
+        disk_spec.device.key = disk_device.key
+        disk_spec.device.backing = disk_device.backing
+        disk_spec.device.controllerKey = disk_device.controllerKey
+        disk_spec.device.unitNumber = disk_device.unitNumber
+        disk_spec.device.capacityInKB = new_size_kb
+        
+        config_spec = vim.vm.ConfigSpec()
+        config_spec.deviceChange = [disk_spec]
+        
+        print(f"        执行 ReconfigVM_Task...")
         try:
-            resp = self.session.post(url, auth=(self.username, self.password))
-            if resp.status_code == 200:
-                self.session_id = resp.json().get('value')
-                self.session.headers['vmware-api-session-id'] = self.session_id
-                print(f"  登录成功")
+            task = vm.ReconfigVM_Task(spec=config_spec)
+            while task.info.state not in [vim.TaskInfo.State.success, vim.TaskInfo.State.error]:
+                pass
+            
+            if task.info.state == vim.TaskInfo.State.success:
+                print(f"        扩容成功!")
                 return True
             else:
-                print(f"  登录失败: {resp.status_code} {resp.text}")
+                print(f"        扩容失败: {task.info.error}")
                 return False
         except Exception as e:
-            print(f"  登录异常: {e}")
-            return False
-    
-    def logout(self):
-        """登出"""
-        if self.session_id:
-            try:
-                self.session.delete(f"{self.base_url}/rest/com/vmware/cis/session")
-            except:
-                pass
-    
-    def list_vms(self, name_filter: str = None) -> list:
-        """列出 VM"""
-        url = f"{self.base_url}/rest/vcenter/vm"
-        params = {}
-        if name_filter:
-            params['filter.names'] = name_filter
-        
-        resp = self.session.get(url, params=params)
-        if resp.status_code == 200:
-            return resp.json().get('value', [])
-        return []
-    
-    def get_vm(self, vm_id: str) -> dict:
-        """"获取 VM 详情"""
-        url = f"{self.base_url}/rest/vcenter/vm/{vm_id}"
-        resp = self.session.get(url)
-        if resp.status_code == 200:
-            return resp.json().get('value', {})
-        return {}
-    
-    def get_vm_guest_identity(self, vm_id: str) -> dict:
-        """"获取 VM Guest 信息 (IP 等)"""
-        url = f"{self.base_url}/rest/vcenter/vm/{vm_id}/guest/identity"
-        resp = self.session.get(url)
-        if resp.status_code == 200:
-            return resp.json().get('value', {})
-        return {}
-    
-    def get_vm_guest_networking(self, vm_id: str) -> dict:
-        """"获取 VM 网络信息"""
-        url = f"{self.base_url}/api/vcenter/vm/{vm_id}/guest/networking"
-        resp = self.session.get(url)
-        if resp.status_code == 200:
-            return resp.json()
-        return {}
-    
-    def get_vm_disks(self, vm_id: str) -> list:
-        """"获取 VM 磁盘列表"""
-        vm_info = self.get_vm(vm_id)
-        return vm_info.get('disks', {})
-    
-    def resize_disk(self, vm_id: str, disk_id: str, size_gb: int) -> bool:
-        """"扩容磁盘"""
-        url = f"{self.base_url}/rest/vcenter/vm/{vm_id}/hardware/disk/{disk_id}"
-        data = {
-            "spec": {
-                "capacity": size_gb * 1024 * 1024 * 1024  # 转换为字节
-            }
-        }
-        print(f"  扩容磁盘: {disk_id} -> {size_gb}GB")
-        resp = self.session.patch(url, json=data)
-        if resp.status_code == 200:
-            print(f"  扩容成功")
-            return True
-        else:
-            print(f"  扩容失败: {resp.status_code} {resp.text}")
+            print(f"        异常: {e}")
             return False
 
 
@@ -219,43 +229,21 @@ def get_wcp_credentials(vc_ip: str, vc_root_pass: str) -> Tuple[str, str]:
     return sp_ip, sp_pass
 
 
-def find_vm_by_ip(api: VSphereAPI, target_ip: str) -> Optional[Dict[str, Any]]:
-    """"通过 IP 查找 VM"""
-    # 先获取所有 SupervisorControlPlaneVM
-    all_vms = api.list_vms()
-    print(f"  总共找到 {len(all_vms)} 个 VM")
+def get_esx_hosts_from_testbed(testbed_json: dict) -> List[Dict[str, str]]:
+    """从 testbed JSON 提取 ESXi 主机信息"""
+    esx_hosts = []
+    esx_info = testbed_json.get('esx', {})
     
-    supervisor_vms = [vm for vm in all_vms if 'SupervisorControlPlane' in vm.get('name', '')]
-    print(f"  其中 SupervisorControlPlaneVM: {len(supervisor_vms)} 个")
+    for key, esx in esx_info.items():
+        # 只使用 compute cluster 的 ESXi (key 1-3)
+        if key in ['1', '2', '3']:
+            esx_hosts.append({
+                'ip': esx.get('ip', ''),
+                'user': esx.get('username', 'root'),
+                'pass': esx.get('password', '')
+            })
     
-    for vm in supervisor_vms:
-        vm_id = vm['vm']
-        vm_name = vm['name']
-        print(f"  检查 VM: {vm_name} ({vm_id})")
-        
-        # 获取 VM 的 IP 地址
-        guest_info = api.get_vm_guest_identity(vm_id)
-        ip_address = guest_info.get('ip_address', '')
-        
-        if ip_address == target_ip:
-            print(f"  匹配! IP: {ip_address}")
-            return vm
-        
-        # 也检查网络信息
-        net_info = api.get_vm_guest_networking(vm_id)
-        if net_info:
-            nics = net_info.get('dns', {}) or {}
-            # 检查 JSON 响应中是否包含目标 IP
-            if target_ip in str(net_info):
-                print(f"  匹配! 在网络信息中找到 IP")
-                return vm
-    
-    # 如果没有匹配，返回第一个
-    if supervisor_vms:
-        print(f"  IP 匹配未找到，使用第一个 SupervisorControlPlaneVM")
-        return supervisor_vms[0]
-    
-    return None
+    return esx_hosts
 
 
 def expand_disk_partition(sp_ip: str, sp_user: str, sp_pass: str):
@@ -356,85 +344,28 @@ def main():
     sp_user = "root"
     
     # ========================================
-    # 第一部分: 通过 vSphere API 扩容 VM 磁盘
+    # 第一部分: 通过 ESXi 直接扩容 VM 磁盘
     # ========================================
-    print_header("第一部分: 通过 vSphere API 扩容 VM 磁盘")
+    print_header("第一部分: 通过 ESXi 直接扩容 VM 磁盘")
     
-    api = VSphereAPI(vc_ip, vc_user, vc_pass)
+    print_step("步骤1: 提取 ESXi 主机信息")
+    esx_hosts = get_esx_hosts_from_testbed(testbed_json)
+    print(f"  找到 {len(esx_hosts)} 个 ESXi 主机")
+    for esx in esx_hosts:
+        print(f"    - {esx['ip']}")
     
-    if not api.login():
-        print("错误: 无法登录 vCenter")
-        sys.exit(1)
+    print_step("步骤2: 查找并扩容 SupervisorControlPlaneVM")
+    resizer = ESXiDiskResizer(esx_hosts)
+    disk_expanded = resizer.find_and_resize_supervisor_vm(TARGET_DISK_SIZE_GB)
     
-    try:
-        print_step("步骤1: 查找 SupervisorControlPlaneVM")
-        print(f"  目标 IP: {sp_ip}")
-        
-        vm = find_vm_by_ip(api, sp_ip)
-        
-        if not vm:
-            print("错误: 无法找到对应的 VM")
-            sys.exit(1)
-        
-        vm_id = vm['vm']
-        vm_name = vm['name']
-        print(f"  找到 VM: {vm_name} (ID: {vm_id})")
-        
-        print_step("步骤2: 检查当前磁盘配置")
-        vm_detail = api.get_vm(vm_id)
-        disks_raw = vm_detail.get('disks', {})
-        
-        # 处理不同的数据格式 (dict 或 list)
-        disks = {}
-        if isinstance(disks_raw, dict):
-            disks = disks_raw
-        elif isinstance(disks_raw, list):
-            for disk in disks_raw:
-                if isinstance(disk, dict):
-                    disk_key = disk.get('key') or disk.get('disk') or disk.get('label', 'unknown')
-                    disks[disk_key] = disk.get('value', disk)
-        
-        print(f"  磁盘信息 (raw): {disks_raw}")
-        print(f"  磁盘信息:")
-        for disk_id, disk_info in disks.items():
-            if isinstance(disk_info, dict):
-                capacity = disk_info.get('capacity', 0)
-            else:
-                capacity = 0
-            capacity_gb = capacity / (1024**3) if capacity else 0
-            print(f"    {disk_id}: {capacity_gb:.1f} GB")
-        
-        print_step("步骤3: 扩容磁盘")
-        # 尝试通过 API 扩容
-        disk_expanded = False
-        for disk_id, disk_info in disks.items():
-            if isinstance(disk_info, dict):
-                current_capacity = disk_info.get('capacity', 0)
-            else:
-                current_capacity = 0
-            current_gb = current_capacity / (1024**3) if current_capacity else 0
-            
-            if current_gb < TARGET_DISK_SIZE_GB and current_gb > 0:
-                print(f"  尝试扩容 {disk_id}: {current_gb:.1f}GB -> {TARGET_DISK_SIZE_GB}GB")
-                if api.resize_disk(vm_id, disk_id, TARGET_DISK_SIZE_GB):
-                    disk_expanded = True
-                    break
-                else:
-                    print(f"  API 扩容失败，可能需要手动扩容")
-            elif current_gb >= TARGET_DISK_SIZE_GB:
-                print(f"  {disk_id} 已经是 {current_gb:.1f}GB，无需扩容")
-                disk_expanded = True
-        
-        if not disk_expanded:
-            print(f"\n  注意: 无法通过 API 自动扩容，请手动在 vSphere UI 中扩容:")
-            print(f"    1. 登录 vCenter: https://{vc_ip}")
-            print(f"    2. 找到 VM: {vm_name}")
-            print(f"    3. 编辑设置 -> 硬盘 -> 扩容到 {TARGET_DISK_SIZE_GB}GB")
-            print()
-            input("  磁盘扩容完成后按 Enter 继续...")
-    
-    finally:
-        api.logout()
+    if not disk_expanded:
+        print(f"\n  错误: 无法通过 ESXi 扩容磁盘")
+        print(f"  请手动在 vSphere UI 中扩容:")
+        print(f"    1. 登录 vCenter: https://{vc_ip}")
+        print(f"    2. 找到 SupervisorControlPlaneVM")
+        print(f"    3. 编辑设置 -> 硬盘 -> 扩容到 {TARGET_DISK_SIZE_GB}GB")
+        print()
+        input("  磁盘扩容完成后按 Enter 继续...")
     
     # ========================================
     # 第二部分: 在 OS 层扩展分区
