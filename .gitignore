@@ -1,0 +1,7 @@
+# idea
+.idea
+testbeds
+testbed.json
+__pycache__
+.DS_Store
+bin/k9s
