@@ -21,56 +21,85 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
 class TestbedParser:
-    def __init__(self, url: str, ssh_config_path: str = None):
-        self.url = url
+    def __init__(self, source: str, ssh_config_path: str = None):
+        self.source = source  # URL or local file path
         self.ssh_config_path = ssh_config_path or os.path.expanduser("~/.ssh/config")
         self.testbed_data = {}
         self.is_wcp = False  # Flag to determine if this is a WCP testbed
-        self.json_backup_dir = os.path.expanduser("~/.ssh/testbed_backups")
+        self.cache_dir = "./testbed"
+        self._build_number = None
         
     def fetch_testbed_json(self) -> Dict:
-        """Fetch testbed JSON from Jenkins URL"""
-        try:
-            response = requests.get(self.url, timeout=30)
-            response.raise_for_status()
-            json_data = response.json()
+        """
+        Fetch testbed JSON from URL or local file
+        URL will be cached to ./testbed/{build_number}.json
+        """
+        # Check if source is URL or local file
+        if self.source.startswith('http://') or self.source.startswith('https://'):
+            build_num = self.extract_build_number()
+            cache_file = f"{self.cache_dir}/{build_num}.json"
             
-            # Save JSON backup
-            self.save_json_backup(json_data)
+            # Check if cache exists
+            if os.path.exists(cache_file):
+                print(f"\033[1;33mUsing cached: {cache_file}\033[0m")
+                with open(cache_file, 'r') as f:
+                    return json.load(f)
             
-            return json_data
-        except requests.RequestException as e:
-            print(f"\033[0;31mError fetching testbed info: {e}\033[0m")
-            sys.exit(1)
-        except json.JSONDecodeError as e:
-            print(f"\033[0;31mError parsing JSON: {e}\033[0m")
-            sys.exit(1)
-    
-    def save_json_backup(self, json_data: Dict):
-        """Save JSON data as backup file"""
-        # Create backup directory if it doesn't exist
-        os.makedirs(self.json_backup_dir, exist_ok=True)
-        
-        # Generate filename with timestamp and build number
-        build_num = self.extract_build_number()
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"testbed_{build_num}_{timestamp}.json"
-        backup_path = os.path.join(self.json_backup_dir, filename)
-        
-        # Save JSON with proper formatting
-        with open(backup_path, 'w') as f:
-            json.dump(json_data, f, indent=2)
-        
-        print(f"\033[1;33mSaved JSON backup: {backup_path}\033[0m")
+            # Download and cache
+            try:
+                print(f"\033[1;33mDownloading: {self.source}\033[0m")
+                response = requests.get(self.source, timeout=30)
+                response.raise_for_status()
+                json_data = response.json()
+                
+                # Save to cache
+                os.makedirs(self.cache_dir, exist_ok=True)
+                with open(cache_file, 'w') as f:
+                    json.dump(json_data, f, indent=2)
+                print(f"\033[1;33mCached to: {cache_file}\033[0m")
+                
+                return json_data
+            except requests.RequestException as e:
+                print(f"\033[0;31mError fetching testbed info: {e}\033[0m")
+                sys.exit(1)
+            except json.JSONDecodeError as e:
+                print(f"\033[0;31mError parsing JSON: {e}\033[0m")
+                sys.exit(1)
+        else:
+            # Local file
+            print(f"\033[1;33mReading local file: {self.source}\033[0m")
+            try:
+                with open(self.source, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"\033[0;31mError reading file: {e}\033[0m")
+                sys.exit(1)
             
     def extract_build_number(self) -> str:
-        """Extract build number from URL"""
-        match = re.search(r'/(\d+)/artifact/', self.url)
+        """Extract build number from URL or filename"""
+        if self._build_number:
+            return self._build_number
+        
+        # Try URL pattern
+        match = re.search(r'/(\d+)/artifact/', self.source)
         if match:
-            return match.group(1)
-        # Try to get from the end of URL path
-        match = re.search(r'/(\d+)/', self.url)
-        return match.group(1) if match else "unknown"
+            self._build_number = match.group(1)
+            return self._build_number
+        
+        # Try URL path
+        match = re.search(r'/(\d+)/', self.source)
+        if match:
+            self._build_number = match.group(1)
+            return self._build_number
+        
+        # Try local filename pattern (e.g., 13989.json)
+        match = re.search(r'(\d+)\.json', self.source)
+        if match:
+            self._build_number = match.group(1)
+            return self._build_number
+        
+        self._build_number = "unknown"
+        return self._build_number
         
     def execute_remote_command(self, host: str, user: str, password: str, command: str) -> str:
         """Execute command on remote host via SSH"""
@@ -280,7 +309,7 @@ Host {host_alias}
             
     def run(self, force: bool = False):
         """Main execution flow"""
-        print(f"\033[1;33mFetching testbed info from: {self.url}\033[0m")
+        print(f"\033[1;33mFetching testbed info from: {self.source}\033[0m")
         
         # Fetch and parse JSON
         json_data = self.fetch_testbed_json()
@@ -325,7 +354,7 @@ Host {host_alias}
 
 def main():
     parser = argparse.ArgumentParser(description='Parse WCP testbed info and add to SSH config')
-    parser.add_argument('url', help='Jenkins testbed info URL')
+    parser.add_argument('source', help='Jenkins testbed info URL or local JSON file path')
     parser.add_argument('--force', '-f', action='store_true', 
                        help='Force overwrite existing SSH config entry')
     parser.add_argument('--ssh-config', '-c', 
@@ -334,7 +363,7 @@ def main():
     args = parser.parse_args()
     
     # Create parser and run
-    testbed_parser = TestbedParser(args.url, args.ssh_config)
+    testbed_parser = TestbedParser(args.source, args.ssh_config)
     testbed_parser.run(force=args.force)
 
 
