@@ -145,26 +145,29 @@ class NSXOperatorStrategy(ContainerConfigurationStrategy):
         """Configure deployment for NSX Operator sleep/debug mode."""
         self._add_operator_volume(deployment, container)
         self._configure_deployment_settings(deployment)
+        
+        # Add securityContext
+        container.security_context = client.V1SecurityContext(
+            run_as_user=0,
+            run_as_non_root=False
+        )
+        self.logger.info(f"Added securityContext to container '{container.name}' for sleep mode")
     
     def configure_normal_mode(self, deployment: client.V1Deployment, container: client.V1Container) -> None:
         """Configure deployment for NSX Operator normal operation mode."""
         self._remove_operator_volume(deployment, container)
         
-        # Check if command contains sleep and remove it
-        if container.command and any("sleep" in str(cmd) for cmd in container.command):
-            self.logger.info(f"Removing sleep command from container '{container.name}'")
-            container.command = None
-            container.args = None
+        # Remove securityContext
+        container.security_context = None
         
-        # Set normal operation command if not already set
-        if not container.command:
-            container.command = [
-                "/usr/local/bin/manager", 
-                "-nsxconfig", self.config.NCP_INI_FILE, 
-                "-health-probe-bind-address", ":8383", 
-                "-log-level", "2"
-            ]
-            container.args = None
+        # Ensure normal operation command and port
+        container.command = [
+            "/usr/local/bin/manager", 
+            "-nsxconfig", self.config.NCP_INI_FILE, 
+            "-health-probe-bind-address", ":8384", 
+            "-log-level", "2"
+        ]
+        container.args = None
         
         # Restore normal liveness probe
         if container.liveness_probe:
@@ -181,7 +184,7 @@ class NSXOperatorStrategy(ContainerConfigurationStrategy):
             container.command = [
                 "/usr/local/bin/manager", 
                 "-nsxconfig", self.config.NCP_INI_FILE, 
-                "-health-probe-bind-address", ":8383", 
+                "-health-probe-bind-address", ":8384", 
                 "-log-level", "2"
             ]
             container.args = None
@@ -202,6 +205,9 @@ class NSXOperatorStrategy(ContainerConfigurationStrategy):
         )
         
         # Add volume if not present
+        if deployment.spec.template.spec.volumes is None:
+            deployment.spec.template.spec.volumes = []
+            
         if not any(vol.name == self.config.NSX_OPERATOR_VOLUME_NAME for vol in deployment.spec.template.spec.volumes):
             deployment.spec.template.spec.volumes.append(volume)
         
@@ -211,26 +217,31 @@ class NSXOperatorStrategy(ContainerConfigurationStrategy):
             mount_path=self.config.NSX_OPERATOR_HOST_PATH
         )
         
+        if container.volume_mounts is None:
+            container.volume_mounts = []
+            
         if not any(mount.name == self.config.NSX_OPERATOR_VOLUME_NAME for mount in container.volume_mounts):
             container.volume_mounts.append(volume_mount)
     
     def _remove_operator_volume(self, deployment: client.V1Deployment, container: client.V1Container) -> None:
         """Remove NSX operator volume and volume mount."""
         # Remove volume
-        deployment.spec.template.spec.volumes = [
-            vol for vol in deployment.spec.template.spec.volumes 
-            if vol.name != self.config.NSX_OPERATOR_VOLUME_NAME
-        ]
+        if deployment.spec.template.spec.volumes:
+            deployment.spec.template.spec.volumes = [
+                vol for vol in deployment.spec.template.spec.volumes 
+                if vol.name != self.config.NSX_OPERATOR_VOLUME_NAME
+            ]
         
         # Remove volume mount
-        container.volume_mounts = [
-            mount for mount in container.volume_mounts 
-            if mount.name != self.config.NSX_OPERATOR_VOLUME_NAME
-        ]
+        if container.volume_mounts:
+            container.volume_mounts = [
+                mount for mount in container.volume_mounts 
+                if mount.name != self.config.NSX_OPERATOR_VOLUME_NAME
+            ]
     
     def _configure_deployment_settings(self, deployment: client.V1Deployment) -> None:
         """Configure deployment-level settings for operator."""
-        deployment.spec.replicas = 1
+        # deployment.spec.replicas = 1
         deployment.spec.template.spec.node_selector = {
             "node-role.kubernetes.io/control-plane": "",
             "current": "current",
@@ -243,10 +254,19 @@ class NSXNCPStrategy(ContainerConfigurationStrategy):
     def configure_sleep_mode(self, deployment: client.V1Deployment, container: client.V1Container) -> None:
         """Configure deployment for NSX NCP sleep/debug mode."""
         self._configure_deployment_settings(deployment)
+        
+        # Add securityContext
+        container.security_context = client.V1SecurityContext(
+            run_as_user=0,
+            run_as_non_root=False
+        )
         self.logger.info(f"Configuring NCP container '{container.name}' for sleep mode")
     
     def configure_normal_mode(self, deployment: client.V1Deployment, container: client.V1Container) -> None:
         """Configure deployment for NSX NCP normal operation mode."""
+        # Remove securityContext
+        container.security_context = None
+        
         # Check if command contains sleep and remove it
         if container.command and any("sleep" in str(cmd) for cmd in container.command):
             self.logger.info(f"Removing sleep command from container '{container.name}'")
@@ -293,7 +313,7 @@ class NSXNCPStrategy(ContainerConfigurationStrategy):
     
     def _configure_deployment_settings(self, deployment: client.V1Deployment) -> None:
         """Configure deployment-level settings for NCP."""
-        deployment.spec.replicas = 1
+        # deployment.spec.replicas = 1
         deployment.spec.template.spec.node_selector = {
             "node-role.kubernetes.io/control-plane": "",
             "current": "current",
@@ -637,7 +657,7 @@ def main() -> None:
     This function orchestrates the entire process of:
     1. Parsing command line arguments
     2. Loading Kubernetes configuration
-    3. Dumping NCP configuration files
+    3. Dumping NCP configuration files (sleep mode only)
     4. Labeling the current node
     5. Updating the deployment based on arguments
     6. Restarting deployment
@@ -662,9 +682,12 @@ def main() -> None:
         
         # Initialize Kubernetes clients
         with KubernetesClientManager(config.KUBE_CONFIG) as k8s_client:
-            # Dump NCP configuration files
-            logger.info("Dumping NCP configuration and credentials")
-            manager.dump_ncp_configuration()
+            # Dump NCP configuration files if in sleep mode
+            if operation_mode == OperationMode.SLEEP:
+                logger.info("Dumping NCP configuration and credentials")
+                manager.dump_ncp_configuration()
+            else:
+                logger.info("Normal mode: skipping NCP configuration dump")
             
             # Label the current node
             logger.info(f"Labeling node {hostname} with current=current")
