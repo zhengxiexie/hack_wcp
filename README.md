@@ -12,7 +12,7 @@ This script handles two types of testbeds:
 
 ## Features
 
-- **Automatically detects** testbed type (regular vs WCP)
+[requirements.txt](../scripts/requirements.txt)[requirements.txt](../scripts/requirements.txt)[requirements.txt](../scripts/requirements.txt)- **Automatically detects** testbed type (regular vs WCP)
 - **Connects to vCenter** to extract WCP credentials when needed
 - **Supports both JSON formats**: nested (`vc.1.ip`) and flat (`vcenterIp`)
 - **Saves JSON backups** to `~/.ssh/testbed_backups/` for reference
