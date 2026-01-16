@@ -267,9 +267,15 @@ class NSXNCPStrategy(ContainerConfigurationStrategy):
         # Remove securityContext
         container.security_context = None
         
-        # Check if command contains sleep and remove it
+        # Check if command or args contains sleep and remove it
+        is_sleep = False
         if container.command and any("sleep" in str(cmd) for cmd in container.command):
-            self.logger.info(f"Removing sleep command from container '{container.name}'")
+            is_sleep = True
+        if container.args and any("sleep" in str(arg) for arg in container.args):
+            is_sleep = True
+            
+        if is_sleep:
+            self.logger.info(f"Removing sleep command/args from container '{container.name}'")
             container.command = None
             container.args = None
         
@@ -533,7 +539,7 @@ class NSXDeploymentManager:
         
         # Apply the deployment update
         try:
-            api.patch_namespaced_deployment(
+            api.replace_namespaced_deployment(
                 name=self.config.DEPLOYMENT_NAME, 
                 namespace=self.config.DEPLOYMENT_NAMESPACE, 
                 body=deployment
